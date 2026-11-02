@@ -11,7 +11,7 @@ pub mod state;
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk::gio;
 use gtk::gio::prelude::*;
@@ -41,8 +41,8 @@ thread_local! {
     static CURRENT_ITEM: RefCell<Option<String>> = const { RefCell::new(None) };
     /// Host: last published (status, loading).
     static LAST_STATUS: Cell<Option<(PlaybackStatus, bool)>> = const { Cell::new(None) };
-    /// Guest: track being loaded to follow the host.
-    static PENDING_TRACK: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Guest: track loads started to follow the host.
+    static LOADS: RefCell<LoadGate> = RefCell::new(LoadGate::default());
     static HOOKED: Cell<bool> = const { Cell::new(false) };
     static OUTPUT_DELAY: Cell<i32> = const { Cell::new(0) };
 }
@@ -233,7 +233,7 @@ pub fn dismiss() {
 fn teardown() {
     let was_guest = matches!(SESSION.with(|s| s.borrow_mut().take()), Some(Session::Guest(_))) || phase().get().is_guest();
     CURRENT_ITEM.with(|c| c.borrow_mut().take());
-    PENDING_TRACK.with(|p| p.borrow_mut().take());
+    drop(LOADS.with(RefCell::take));
     LAST_STATUS.with(|l| l.set(None));
     if was_guest {
         player::set_rate(1.0);
@@ -346,6 +346,89 @@ pub fn paused_needs_seek(target_ms: i64, actual_ms: i64) -> bool {
     (target_ms - actual_ms).abs() > SEEK_MS
 }
 
+/// How long a track the guest's account could not play is left alone.
+const RETRY_FAILED: Duration = Duration::from_secs(15);
+
+/// Guest: which host tracks are being loaded or failed recently, so a tick
+/// never starts a second load of the same track and an unavailable track is
+/// not retried (and toasted) every tick.
+#[derive(Debug, Default)]
+pub struct LoadGate {
+    pending: Option<String>,
+    failed: Option<(String, Instant)>,
+}
+
+impl LoadGate {
+    /// Whether a load of `track` should start now.
+    pub fn begin(&mut self, track: &str, now: Instant) -> bool {
+        if self.pending.as_deref() == Some(track) {
+            return false;
+        }
+        if let Some((t, at)) = &self.failed
+            && t == track
+            && now.duration_since(*at) < RETRY_FAILED
+        {
+            return false;
+        }
+        self.pending = Some(track.to_string());
+        true
+    }
+    /// The player now has the host's track.
+    pub fn loaded(&mut self) {
+        self.pending = None;
+        self.failed = None;
+    }
+    /// A load ended without playing (failed or superseded).
+    /// Returns true on the first failure of this track (worth a toast).
+    pub fn failed(&mut self, track: &str, now: Instant) -> bool {
+        if self.pending.as_deref() == Some(track) {
+            self.pending = None;
+        }
+        let first = self.failed.as_ref().is_none_or(|(t, _)| t != track);
+        self.failed = Some((track.to_string(), now));
+        first
+    }
+    /// A load was dropped because the host moved on.
+    pub fn abandon(&mut self, track: &str) {
+        if self.pending.as_deref() == Some(track) {
+            self.pending = None;
+        }
+    }
+}
+
+/// Fetches the host's track with the guest's own TIDAL session, then plays it
+/// only if the same session still wants it, honouring the host's pause.
+fn load_host_track(track: String) {
+    let generation = current_generation();
+    glib::spawn_future_local(async move {
+        let id = track.clone();
+        let r = crate::api::run(move || crate::service::get_track(&id)).await;
+        if generation != current_generation() {
+            return; // session ended or changed meanwhile; teardown reset the gate
+        }
+        let latency = i64::from(output_delay_ms());
+        let want = guest().and_then(|g| g.target(latency));
+        if want.as_ref().and_then(|t| t.track_id.as_deref()) != Some(track.as_str()) {
+            LOADS.with(|l| l.borrow_mut().abandon(&track));
+            return;
+        }
+        match r {
+            Ok(t) => {
+                player::play_track(t);
+                if want.is_some_and(|t| !t.playing) {
+                    player::pause();
+                }
+            }
+            Err(e) => {
+                log::error!("failed to load the host's track error={e:#}");
+                if LOADS.with(|l| l.borrow_mut().failed(&track, Instant::now())) {
+                    player::toasts().notify(&tr("Could not play the host's track with your account"));
+                }
+            }
+        }
+    });
+}
+
 /// Moves the local player towards the host's anchor.
 fn guest_tick() {
     let Some(g) = guest() else { return };
@@ -360,21 +443,12 @@ fn guest_tick() {
         return;
     };
     if player::current_track_id().as_deref() != Some(track.as_str()) {
-        let already = PENDING_TRACK.with(|p| p.borrow().as_deref() == Some(track.as_str()));
-        if !already {
-            PENDING_TRACK.with(|p| *p.borrow_mut() = Some(track.clone()));
-            glib::spawn_future_local(async move {
-                // Through the guest's own TIDAL session.
-                if let Err(e) = player::play_track_id(&track).await {
-                    log::error!("failed to load the host's track error={e:#}");
-                    player::toasts().notify(&tr("Could not play the host's track with your account"));
-                    PENDING_TRACK.with(|p| p.borrow_mut().take());
-                }
-            });
+        if LOADS.with(|l| l.borrow_mut().begin(&track, Instant::now())) {
+            load_host_track(track);
         }
         return;
     }
-    PENDING_TRACK.with(|p| p.borrow_mut().take());
+    LOADS.with(|l| l.borrow_mut().loaded());
     if ps.loading {
         return;
     }
@@ -425,6 +499,38 @@ mod tests {
     fn queue_is_capped() {
         let base: Vec<String> = (0..MAX_QUEUE + 10).map(|i| i.to_string()).collect();
         assert_eq!(shared_track_ids(Some("x"), &[], &base).len(), MAX_QUEUE);
+    }
+
+    #[test]
+    fn load_gate_starts_each_track_once() {
+        let now = Instant::now();
+        let mut g = LoadGate::default();
+        assert!(g.begin("1", now));
+        assert!(!g.begin("1", now));
+        assert!(g.begin("2", now), "a new host track starts its own load");
+        g.loaded();
+        assert!(g.begin("2", now));
+    }
+
+    #[test]
+    fn load_gate_backs_off_failed_tracks() {
+        let now = Instant::now();
+        let mut g = LoadGate::default();
+        assert!(g.begin("1", now));
+        assert!(g.failed("1", now), "first failure is reported");
+        assert!(!g.begin("1", now + Duration::from_secs(1)));
+        assert!(g.begin("1", now + RETRY_FAILED));
+        assert!(!g.failed("1", now + RETRY_FAILED), "repeated failure is not reported again");
+        assert!(g.begin("2", now), "other tracks are not blocked");
+    }
+
+    #[test]
+    fn abandoned_load_can_restart() {
+        let now = Instant::now();
+        let mut g = LoadGate::default();
+        assert!(g.begin("1", now));
+        g.abandon("1");
+        assert!(g.begin("1", now));
     }
 
     #[test]
