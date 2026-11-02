@@ -190,3 +190,10 @@ impl LiveGuest {
 pub fn live_is_invite(text: String) -> bool {
     tonearm_core::live::ticket::Ticket::parse(&text).is_ok()
 }
+
+/// One track by id (guests resolve the shared queue's ids with their own account).
+#[uniffi::export]
+pub async fn live_track(id: String) -> Result<crate::Track, FfiError> {
+    let t = crate::run(move || tonearm_core::service::get_track(&id)).await?;
+    Ok(crate::convert::tracks(std::slice::from_ref(&t)).remove(0))
+}
