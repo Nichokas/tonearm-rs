@@ -11,12 +11,14 @@
 mod auth;
 mod convert;
 mod library;
+mod live;
 mod playback;
 mod scrobbling;
 
 pub use auth::*;
 pub use convert::*;
 pub use library::*;
+pub use live::*;
 pub use playback::*;
 pub use scrobbling::*;
 

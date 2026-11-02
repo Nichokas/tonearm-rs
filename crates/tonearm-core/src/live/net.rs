@@ -1,0 +1,482 @@
+//! iroh transport for Listen Together (feature `live-net`).
+//!
+//! Star topology: guests dial the host's endpoint with ALPN `sdat-live/1` and
+//! keep one bidirectional stream of length-prefixed messages. iroh tries a
+//! direct connection first and falls back to a relay. Relays are configurable
+//! ([`NetConfig`]); no key or secret lives in the code.
+
+#![allow(clippy::clone_on_ref_ptr, clippy::semicolon_outside_block, clippy::needless_pass_by_value, reason = "async task wiring: clones move into spawned tasks")]
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
+
+use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
+use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, RelayUrl};
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
+
+use super::drift::Correction;
+use super::proto::{self, EndReason, Msg, RejectReason};
+use super::queue::{OpKind, QueueItem};
+use super::session::{GuestEvent, GuestInfo, GuestPhase, GuestSession, HostSession, Target, To};
+use super::ticket::Ticket;
+use super::{ALPN, PROTO_VERSION, mono_now_ns, new_id};
+
+/// Relay of the SDAT project on iroh services (public URL, not a secret).
+pub const DEFAULT_RELAYS: &[&str] = &["https://efc2pr1s527pykb0a.euc1.relay.iroh-svc.com/"];
+/// Comma-separated relay URLs overriding [`DEFAULT_RELAYS`].
+pub const RELAYS_ENV: &str = "SDAT_LIVE_RELAYS";
+
+#[derive(Debug, Clone)]
+pub struct NetConfig {
+    /// Preferred relays, tried as home relay first.
+    pub relays: Vec<String>,
+    /// Also use n0's public relays as fallback.
+    pub n0_fallback: bool,
+}
+
+impl Default for NetConfig {
+    /// [`DEFAULT_RELAYS`] (or `SDAT_LIVE_RELAYS`) plus n0's public relays.
+    fn default() -> Self {
+        let relays = std::env::var(RELAYS_ENV)
+            .ok()
+            .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_RELAYS.iter().map(|s| (*s).to_owned()).collect());
+        Self { relays, n0_fallback: true }
+    }
+}
+
+impl NetConfig {
+    fn relay_mode(&self) -> RelayMode {
+        let mut urls: Vec<RelayUrl> = self.relays.iter().filter_map(|u| u.parse().ok()).collect();
+        if self.n0_fallback {
+            urls.extend(RelayMode::Default.relay_map().urls::<Vec<_>>());
+        }
+        if urls.is_empty() { RelayMode::Default } else { RelayMode::Custom(urls.into_iter().collect::<RelayMap>()) }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NetError {
+    #[error("{0}")]
+    Ticket(#[from] super::ticket::TicketError),
+    #[error("network: {0}")]
+    Net(String),
+}
+
+fn net<E: std::fmt::Display>(e: E) -> NetError {
+    NetError::Net(e.to_string())
+}
+
+fn runtime() -> &'static Runtime {
+    static RT: OnceLock<Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("live").enable_all().build().expect("tokio runtime")
+    })
+}
+
+async fn bind(cfg: &NetConfig, alpns: Vec<Vec<u8>>) -> Result<Endpoint, NetError> {
+    Endpoint::builder(presets::N0).relay_mode(cfg.relay_mode()).alpns(alpns).bind().await.map_err(net)
+}
+
+async fn write_msg(send: &mut SendStream, m: &Msg) -> Result<(), NetError> {
+    let f = proto::encode(m).map_err(net)?;
+    send.write_all(&f).await.map_err(net)
+}
+
+async fn read_msg(recv: &mut RecvStream) -> Result<Msg, NetError> {
+    let mut h = [0u8; 4];
+    recv.read_exact(&mut h).await.map_err(net)?;
+    let mut body = vec![0u8; proto::frame_len(h).map_err(net)?];
+    recv.read_exact(&mut body).await.map_err(net)?;
+    proto::decode(&body).map_err(net)
+}
+
+/// Everything the UI needs to hear about.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiveEvent {
+    /// Host: guests list changed.
+    Guests(Vec<GuestInfo>),
+    Guest(GuestEvent),
+    /// Guest: connection dropped, retrying.
+    Reconnecting,
+}
+
+pub trait LiveListener: Send + Sync {
+    fn on_event(&self, ev: LiveEvent);
+}
+
+// ---------------------------------------------------------------- host
+
+pub struct LiveHost {
+    state: Arc<Mutex<HostSession>>,
+    peers: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Msg>>>>,
+    endpoint: Endpoint,
+    ticket: Ticket,
+    stop: Arc<tokio::sync::Notify>,
+}
+
+impl std::fmt::Debug for LiveHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveHost").finish_non_exhaustive()
+    }
+}
+
+type Peers = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Msg>>>>;
+
+fn route(peers: &Peers, outs: Vec<super::session::Out>) {
+    let p = peers.lock().unwrap_or_else(PoisonError::into_inner);
+    for o in outs {
+        match o.to {
+            To::All => p.values().for_each(|tx| drop(tx.send(o.msg.clone()))),
+            To::Peer(id) => {
+                if let Some(tx) = p.get(&id) {
+                    drop(tx.send(o.msg));
+                }
+            }
+        }
+    }
+}
+
+impl LiveHost {
+    /// Opens a session. Returns once the endpoint is online (or after a
+    /// short timeout, so a relay outage still leaves direct connections).
+    pub fn start(name: String, cfg: &NetConfig, listener: Arc<dyn LiveListener>) -> Result<Self, NetError> {
+        runtime().block_on(async {
+            let endpoint = bind(cfg, vec![ALPN.to_vec()]).await?;
+            drop(tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await);
+            let state = Arc::new(Mutex::new(HostSession::new(name.clone(), mono_now_ns())));
+            let secret = state.lock().unwrap_or_else(PoisonError::into_inner).secret.clone();
+            let addr = serde_json::to_string(&endpoint.addr()).map_err(net)?;
+            let ticket = Ticket { v: PROTO_VERSION, addr, secret, name: Some(name) };
+            let peers: Peers = Arc::default();
+            let stop = Arc::new(tokio::sync::Notify::new());
+            // Accept loop.
+            {
+                let (ep, state, peers, listener, stop) = (endpoint.clone(), state.clone(), peers.clone(), listener.clone(), stop.clone());
+                tokio::spawn(async move {
+                    loop {
+                        let inc = tokio::select! { i = ep.accept() => i, () = stop.notified() => None };
+                        let Some(inc) = inc else { break };
+                        let (state, peers, listener) = (state.clone(), peers.clone(), listener.clone());
+                        tokio::spawn(async move {
+                            if let Ok(conn) = inc.await {
+                                serve_guest(conn, state, peers, listener).await;
+                            }
+                        });
+                    }
+                });
+            }
+            // Ticks: heartbeats, debounced anchors.
+            {
+                let (state, peers, stop) = (state.clone(), peers.clone(), stop.clone());
+                tokio::spawn(async move {
+                    let mut iv = tokio::time::interval(Duration::from_millis(250));
+                    loop {
+                        tokio::select! { _ = iv.tick() => {}, () = stop.notified() => break }
+                        let outs = state.lock().unwrap_or_else(PoisonError::into_inner).tick(mono_now_ns());
+                        route(&peers, outs);
+                    }
+                });
+            }
+            Ok(Self { state, peers, endpoint, ticket, stop })
+        })
+    }
+
+    pub fn ticket_url(&self) -> String {
+        self.ticket.to_url()
+    }
+
+    pub fn guests(&self) -> Vec<GuestInfo> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).guests()
+    }
+
+    pub fn set_playback(&self, item_id: Option<String>, track_id: Option<String>, position_ms: i64, playing: bool) {
+        let outs = self.state.lock().unwrap_or_else(PoisonError::into_inner).set_playback(item_id, track_id, position_ms, playing, mono_now_ns());
+        route(&self.peers, outs);
+    }
+
+    /// Replaces the shared queue; returns the entry ids given to each track.
+    pub fn replace_queue(&self, track_ids: Vec<String>) -> Result<Vec<String>, NetError> {
+        let items: Vec<QueueItem> = track_ids.into_iter().take(super::MAX_QUEUE).map(|track_id| QueueItem { item_id: new_id(), track_id }).collect();
+        let ids = items.iter().map(|i| i.item_id.clone()).collect();
+        let outs = self.state.lock().unwrap_or_else(PoisonError::into_inner).queue_op(OpKind::Replace { items }).map_err(net)?;
+        route(&self.peers, outs);
+        Ok(ids)
+    }
+
+    /// Ends the session for everyone.
+    pub fn end(&self) {
+        let outs = self.state.lock().unwrap_or_else(PoisonError::into_inner).end();
+        route(&self.peers, outs);
+        self.stop.notify_waiters();
+        let ep = self.endpoint.clone();
+        runtime().spawn(async move {
+            // Let the End message flush before closing.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            ep.close().await;
+        });
+    }
+}
+
+async fn serve_guest(conn: Connection, state: Arc<Mutex<HostSession>>, peers: Peers, listener: Arc<dyn LiveListener>) {
+    let peer = conn.remote_id().to_string();
+    let Ok((mut send, mut recv)) = conn.accept_bi().await else { return };
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    peers.lock().unwrap_or_else(PoisonError::into_inner).insert(peer.clone(), tx);
+    let writer = tokio::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            let end = matches!(m, Msg::End { .. } | Msg::Reject { .. });
+            if write_msg(&mut send, &m).await.is_err() {
+                break;
+            }
+            if end {
+                drop(send.finish());
+                break;
+            }
+        }
+    });
+    let mut known = 0;
+    while let Ok(m) = read_msg(&mut recv).await {
+        let now = mono_now_ns();
+        let (outs, guests) = {
+            let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
+            let outs = s.on_message(&peer, m, now);
+            (outs, s.guests())
+        };
+        route(&peers, outs);
+        if guests.len() != known {
+            known = guests.len();
+            listener.on_event(LiveEvent::Guests(guests));
+        }
+    }
+    peers.lock().unwrap_or_else(PoisonError::into_inner).remove(&peer);
+    let guests = {
+        let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.peer_disconnected(&peer);
+        s.guests()
+    };
+    listener.on_event(LiveEvent::Guests(guests));
+    writer.abort();
+}
+
+// ---------------------------------------------------------------- guest
+
+pub struct LiveGuest {
+    state: Arc<Mutex<GuestSession>>,
+    tx: Arc<Mutex<Option<mpsc::UnboundedSender<Msg>>>>,
+    stop: Arc<tokio::sync::Notify>,
+}
+
+impl std::fmt::Debug for LiveGuest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveGuest").finish_non_exhaustive()
+    }
+}
+
+fn finished(s: &GuestSession) -> bool {
+    matches!(s.phase(), GuestPhase::Ended(_) | GuestPhase::Rejected(_))
+}
+
+impl LiveGuest {
+    /// Parses `sdat://join/...` and starts connecting in the background.
+    /// Progress arrives through `listener` (`Joined`, `Rejected`, `Ended`).
+    pub fn join(url: &str, name: String, cfg: &NetConfig, listener: Arc<dyn LiveListener>) -> Result<Self, NetError> {
+        let ticket = Ticket::parse(url)?;
+        let addr: EndpointAddr = serde_json::from_str(&ticket.addr).map_err(|_e| NetError::Ticket(super::ticket::TicketError::Malformed))?;
+        let state = Arc::new(Mutex::new(GuestSession::new(ticket.secret, name, mono_now_ns())));
+        let tx: Arc<Mutex<Option<mpsc::UnboundedSender<Msg>>>> = Arc::default();
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let cfg = cfg.clone();
+        {
+            let (state, tx, stop, listener) = (state.clone(), tx.clone(), stop.clone(), listener.clone());
+            runtime().spawn(async move {
+                let ep = match bind(&cfg, Vec::new()).await {
+                    Ok(ep) => ep,
+                    Err(_) => {
+                        listener.on_event(LiveEvent::Guest(GuestEvent::Ended(EndReason::HostLost)));
+                        return;
+                    }
+                };
+                let mut first = true;
+                loop {
+                    if finished(&state.lock().unwrap_or_else(PoisonError::into_inner)) {
+                        break;
+                    }
+                    if !first {
+                        listener.on_event(LiveEvent::Reconnecting);
+                    }
+                    let attempt = tokio::select! {
+                        r = tokio::time::timeout(Duration::from_secs(8), ep.connect(addr.clone(), ALPN)) => r,
+                        () = stop.notified() => break,
+                    };
+                    if let Ok(Ok(conn)) = attempt
+                        && let Ok((send, recv)) = conn.open_bi().await
+                    {
+                        let hello = {
+                            let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
+                            if first { vec![s.hello()] } else { s.on_reconnect(mono_now_ns()) }
+                        };
+                        first = false;
+                        run_guest_conn(send, recv, hello, &state, &tx, &listener, &stop).await;
+                        conn.close(0u32.into(), b"bye");
+                    }
+                    // The session's own timeout (no host for 10 s) ends it.
+                    let (_, ev) = state.lock().unwrap_or_else(PoisonError::into_inner).tick(mono_now_ns());
+                    ev.into_iter().for_each(|e| listener.on_event(LiveEvent::Guest(e)));
+                    tokio::select! { () = tokio::time::sleep(Duration::from_secs(1)) => {}, () = stop.notified() => break }
+                }
+                ep.close().await;
+            });
+        }
+        Ok(Self { state, tx, stop })
+    }
+
+    /// Where the local player should be (`latency_ms`: output latency +
+    /// manual offset). `None` until the clock is calibrated.
+    pub fn target(&self, latency_ms: i64) -> Option<Target> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).target(mono_now_ns(), latency_ms)
+    }
+
+    pub fn correction(&self, latency_ms: i64, actual_ms: i64) -> Correction {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).correction(mono_now_ns(), latency_ms, actual_ms)
+    }
+
+    pub fn queue(&self) -> Vec<QueueItem> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).queue_items().to_vec()
+    }
+
+    pub fn host_name(&self) -> String {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).host_name.clone()
+    }
+
+    pub fn set_seek_only(&self, on: bool) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).set_seek_only(on);
+    }
+
+    pub fn reject_reason(&self) -> Option<RejectReason> {
+        match self.state.lock().unwrap_or_else(PoisonError::into_inner).phase() {
+            GuestPhase::Rejected(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    pub fn leave(&self) {
+        let msgs = self.state.lock().unwrap_or_else(PoisonError::into_inner).leave();
+        if let Some(tx) = self.tx.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            msgs.into_iter().for_each(|m| drop(tx.send(m)));
+        }
+        let stop = self.stop.clone();
+        runtime().spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.notify_waiters();
+        });
+    }
+}
+
+async fn run_guest_conn(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    hello: Vec<Msg>,
+    state: &Arc<Mutex<GuestSession>>,
+    tx_slot: &Arc<Mutex<Option<mpsc::UnboundedSender<Msg>>>>,
+    listener: &Arc<dyn LiveListener>,
+    stop: &Arc<tokio::sync::Notify>,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    *tx_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx.clone());
+    hello.into_iter().for_each(|m| drop(tx.send(m)));
+    let writer = tokio::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            let bye = matches!(m, Msg::Bye);
+            if write_msg(&mut send, &m).await.is_err() {
+                break;
+            }
+            if bye {
+                drop(send.finish());
+                break;
+            }
+        }
+    });
+    let emit = |ev: Vec<GuestEvent>| ev.into_iter().for_each(|e| listener.on_event(LiveEvent::Guest(e)));
+    let mut iv = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            m = read_msg(&mut recv) => {
+                let Ok(m) = m else { break };
+                let (out, ev) = state.lock().unwrap_or_else(PoisonError::into_inner).on_message(m, mono_now_ns());
+                out.into_iter().for_each(|m| drop(tx.send(m)));
+                emit(ev);
+            }
+            _ = iv.tick() => {
+                let (out, ev) = state.lock().unwrap_or_else(PoisonError::into_inner).tick(mono_now_ns());
+                out.into_iter().for_each(|m| drop(tx.send(m)));
+                emit(ev);
+            }
+            () = stop.notified() => break,
+        }
+        if finished(&state.lock().unwrap_or_else(PoisonError::into_inner)) {
+            break;
+        }
+    }
+    *tx_slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    drop(tx);
+    drop(tokio::time::timeout(Duration::from_millis(500), writer).await);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_prefers_project_relay_then_n0() {
+        let cfg = NetConfig { relays: DEFAULT_RELAYS.iter().map(|s| (*s).to_owned()).collect(), n0_fallback: true };
+        let RelayMode::Custom(map) = cfg.relay_mode() else { panic!() };
+        let urls: Vec<RelayUrl> = map.urls();
+        assert!(urls.len() > 1);
+        assert!(urls.iter().any(|u| u.as_str().contains("iroh-svc.com")));
+        let only = NetConfig { relays: vec![], n0_fallback: false };
+        assert_eq!(only.relay_mode(), RelayMode::Default);
+    }
+
+    #[derive(Default)]
+    struct Rec(Mutex<Vec<LiveEvent>>);
+    impl LiveListener for Rec {
+        fn on_event(&self, ev: LiveEvent) {
+            self.0.lock().unwrap().push(ev);
+        }
+    }
+
+    /// Real iroh connection between two endpoints on this machine. Needs
+    /// network (relays / address lookup), so it is ignored by default:
+    /// `cargo test -p tonearm-core --features live-net -- --ignored live_loopback`
+    #[test]
+    #[ignore = "needs network"]
+    fn live_loopback() {
+        let cfg = NetConfig::default();
+        let hl = Arc::new(Rec::default());
+        let host = LiveHost::start("Host".into(), &cfg, hl.clone()).unwrap();
+        host.replace_queue(vec!["1".into(), "2".into(), "3".into()]).unwrap();
+        let q = host.state.lock().unwrap().queue_items().to_vec();
+        host.set_playback(Some(q[1].item_id.clone()), Some("2".into()), 30_000, true);
+        let gl = Arc::new(Rec::default());
+        let guest = LiveGuest::join(&host.ticket_url(), "Guest".into(), &cfg, gl.clone()).unwrap();
+        let mut target = None;
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(100));
+            target = guest.target(0);
+            if target.is_some() {
+                break;
+            }
+        }
+        let t = target.expect("guest calibrated and got the anchor");
+        assert_eq!(t.track_id.as_deref(), Some("2"));
+        assert_eq!(guest.queue().len(), 3);
+        assert!(hl.0.lock().unwrap().iter().any(|e| matches!(e, LiveEvent::Guests(g) if g.len() == 1)));
+        host.end();
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(gl.0.lock().unwrap().contains(&LiveEvent::Guest(GuestEvent::Ended(EndReason::HostEnded))));
+    }
+}
