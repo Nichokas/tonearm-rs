@@ -95,6 +95,9 @@ async fn read_msg(recv: &mut RecvStream) -> Result<Msg, NetError> {
     proto::decode(&body).map_err(net)
 }
 
+/// Messages buffered between the frame reader and the session.
+const READ_BUFFER: usize = 32;
+
 /// One-shot stop signal. Unlike a bare `Notify::notify_waiters`, a task
 /// that starts waiting after the signal still sees it.
 #[derive(Debug, Default)]
@@ -129,11 +132,13 @@ impl Stop {
 /// Reads whole messages in their own task, so callers can `select!` on the
 /// channel without cancelling a half-read frame (`read_exact` is not
 /// cancel-safe).
-fn spawn_reader(mut recv: RecvStream) -> (mpsc::UnboundedReceiver<Msg>, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+/// The channel is bounded: when the consumer falls behind, the reader stops
+/// reading and QUIC flow control pushes back on the host.
+fn spawn_reader(mut recv: RecvStream) -> (mpsc::Receiver<Msg>, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel(READ_BUFFER);
     let h = tokio::spawn(async move {
         while let Ok(m) = read_msg(&mut recv).await {
-            if tx.send(m).is_err() {
+            if tx.send(m).await.is_err() {
                 break;
             }
         }
@@ -251,7 +256,8 @@ impl LiveHost {
                     let mut iv = tokio::time::interval(Duration::from_millis(250));
                     loop {
                         tokio::select! { _ = iv.tick() => {}, () = stop.wait() => break }
-                        let outs = state.lock().unwrap_or_else(PoisonError::into_inner).tick(mono_now_ns());
+                        let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
+                        let outs = s.tick(mono_now_ns());
                         route(&peers, outs);
                     }
                 });
@@ -269,7 +275,8 @@ impl LiveHost {
     }
 
     pub fn set_playback(&self, item_id: Option<String>, track_id: Option<String>, position_ms: i64, playing: bool) {
-        let outs = self.state.lock().unwrap_or_else(PoisonError::into_inner).set_playback(item_id, track_id, position_ms, playing, mono_now_ns());
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let outs = s.set_playback(item_id, track_id, position_ms, playing, mono_now_ns());
         route(&self.peers, outs);
     }
 
@@ -277,8 +284,10 @@ impl LiveHost {
     pub fn replace_queue(&self, track_ids: Vec<String>) -> Result<Vec<String>, NetError> {
         let items: Vec<QueueItem> = track_ids.into_iter().take(super::MAX_QUEUE).map(|track_id| QueueItem { item_id: new_id(), track_id }).collect();
         let ids = items.iter().map(|i| i.item_id.clone()).collect();
-        let outs = self.state.lock().unwrap_or_else(PoisonError::into_inner).queue_op(OpKind::Replace { items }).map_err(net)?;
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let outs = s.queue_op(OpKind::Replace { items }).map_err(net)?;
         route(&self.peers, outs);
+        drop(s);
         Ok(ids)
     }
 
@@ -287,8 +296,10 @@ impl LiveHost {
         if !self.stop.trigger() {
             return;
         }
-        let outs = self.state.lock().unwrap_or_else(PoisonError::into_inner).end();
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let outs = s.end();
         route(&self.peers, outs);
+        drop(s);
         let ep = self.endpoint.clone();
         runtime().spawn(async move {
             // Let the End message flush before closing.
@@ -319,17 +330,21 @@ async fn serve_guest(conn: Connection, state: Arc<Mutex<HostSession>>, peers: Pe
     let mut known = 0;
     while let Ok(m) = read_msg(&mut recv).await {
         let now = mono_now_ns();
-        let (outs, guests) = {
+        // Snapshot (Welcome), registration and routing happen under the
+        // state lock, and every other sender routes under it too, so no
+        // queue or playback update can fall between them.
+        let guests = {
             let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
             let outs = s.on_message(&peer, m, now);
-            (outs, s.guests())
+            let guests = s.guests();
+            // Broadcasts reach a connection only once its Hello is accepted.
+            if !registered && guests.iter().any(|g| g.peer == peer) {
+                registered = true;
+                peers.lock().unwrap_or_else(PoisonError::into_inner).insert(peer.clone(), (token, tx.clone()));
+            }
+            route_from(&peers, outs, Some((&peer, &tx)));
+            guests
         };
-        // Broadcasts reach a connection only once its Hello is accepted.
-        if !registered && guests.iter().any(|g| g.peer == peer) {
-            registered = true;
-            peers.lock().unwrap_or_else(PoisonError::into_inner).insert(peer.clone(), (token, tx.clone()));
-        }
-        route_from(&peers, outs, Some((&peer, &tx)));
         if guests.len() != known {
             known = guests.len();
             listener.on_event(LiveEvent::Guests(guests));
