@@ -29,6 +29,10 @@ pub struct Out {
 fn to(peer: &str, msg: Msg) -> Out {
     Out { to: To::Peer(peer.to_owned()), msg }
 }
+/// Whether a catch-up batch fits one frame; otherwise a snapshot is sent.
+fn fits_frame(ops: &[super::queue::VersionedOp]) -> bool {
+    super::proto::encode(&Msg::Ops { ops: ops.to_vec() }).is_ok()
+}
 fn all(msg: Msg) -> Out {
     Out { to: To::All, msg }
 }
@@ -109,7 +113,7 @@ impl HostSession {
             }
             _ if !self.guests.contains_key(peer) => Vec::new(), // must say Hello first
             Msg::Ping { id, t0 } => vec![to(peer, Msg::Pong { id, t0, t1: now_ns, t2: now_ns })],
-            Msg::Resync { have } => match self.queue.ops_since(have) {
+            Msg::Resync { have } => match self.queue.ops_since(have).filter(|ops| fits_frame(ops)) {
                 Some(ops) => {
                     let mut v = vec![to(peer, Msg::Ops { ops })];
                     v.push(to(peer, Msg::Anchor(self.anchor.clone())));
@@ -315,7 +319,12 @@ impl GuestSession {
         newer
     }
 
-    fn queue_result(&mut self, r: GuestApply, now_ns: i64, out: &mut Vec<Msg>, ev: &mut Vec<GuestEvent>) {
+    /// `before`: queue version before the update, so a partial advance (one
+    /// that still leaves a gap) is reported too.
+    fn queue_result(&mut self, r: GuestApply, before: u64, now_ns: i64, out: &mut Vec<Msg>, ev: &mut Vec<GuestEvent>) {
+        if !matches!(r, GuestApply::Changed) && self.queue.queue().version != before {
+            ev.push(GuestEvent::QueueChanged);
+        }
         match r {
             GuestApply::Changed => {
                 self.gap_since = None;
@@ -360,8 +369,9 @@ impl GuestSession {
                     self.queue = GuestQueue::new();
                     self.anchor = None;
                 }
+                let before = self.queue.queue().version;
                 let r = self.queue.apply_snapshot(snapshot);
-                self.queue_result(r, now_ns, &mut out, &mut ev);
+                self.queue_result(r, before, now_ns, &mut out, &mut ev);
                 if self.take_anchor(anchor) {
                     ev.push(GuestEvent::PlaybackChanged);
                 }
@@ -384,8 +394,9 @@ impl GuestSession {
                 }
             }
             Msg::Op(op) => {
+                let before = self.queue.queue().version;
                 let r = self.queue.apply(op);
-                self.queue_result(r, now_ns, &mut out, &mut ev);
+                self.queue_result(r, before, now_ns, &mut out, &mut ev);
             }
             Msg::Ops { ops } => {
                 let before = self.queue.queue().version;
@@ -398,22 +409,14 @@ impl GuestSession {
                 }
                 self.resync_sent_ns = None;
                 let changed = self.queue.queue().version != before;
-                match last {
-                    GuestApply::NeedSnapshot | GuestApply::Gap { .. } => {
-                        if changed {
-                            ev.push(GuestEvent::QueueChanged);
-                        }
-                        // A gap left behind keeps its timer so `tick` resyncs.
-                        self.queue_result(last, now_ns, &mut out, &mut ev);
-                    }
-                    _ if changed => self.queue_result(GuestApply::Changed, now_ns, &mut out, &mut ev),
-                    _ => {}
-                }
+                let r = if changed && matches!(last, GuestApply::Ignored) { GuestApply::Changed } else { last };
+                self.queue_result(r, before, now_ns, &mut out, &mut ev);
             }
             Msg::Snapshot(s) => {
                 self.resync_sent_ns = None;
+                let before = self.queue.queue().version;
                 let r = self.queue.apply_snapshot(s);
-                self.queue_result(r, now_ns, &mut out, &mut ev);
+                self.queue_result(r, before, now_ns, &mut out, &mut ev);
             }
             Msg::End { reason } => ev.extend(self.ended(reason)),
             Msg::Heartbeat { .. } | Msg::Hello { .. } | Msg::Ping { .. } | Msg::Resync { .. } | Msg::Bye | Msg::Unknown => {}
@@ -619,6 +622,31 @@ mod tests {
         assert!(ev.contains(&GuestEvent::QueueChanged), "{ev:?}");
         let (out, _) = w.guest.tick(S + GAP_TIMEOUT_NS + 10 * MS);
         assert!(out.iter().any(|m| matches!(m, Msg::Resync { .. })), "{out:?}");
+    }
+
+    #[test]
+    fn single_op_partial_advance_reports_change() {
+        use super::super::queue::{Op, VersionedOp};
+        let mut w = World::new(0, MS);
+        w.host.queue_op(OpKind::Replace { items: items(4) }).unwrap();
+        w.join(0);
+        let mk = |ver: u64| VersionedOp { version: ver, op: Op { op_id: format!("o{ver}"), kind: OpKind::Remove { item_id: format!("i{}", ver - 2) } } };
+        let (_, ev) = w.guest.on_message(Msg::Op(mk(4)), S);
+        assert!(!ev.contains(&GuestEvent::QueueChanged));
+        let (_, ev) = w.guest.on_message(Msg::Op(mk(2)), S);
+        assert!(ev.contains(&GuestEvent::QueueChanged), "{ev:?}");
+    }
+
+    #[test]
+    fn oversized_catch_up_falls_back_to_snapshot() {
+        let mut w = World::new(0, MS);
+        w.join(0);
+        let big = |p: &str| (0..500).map(|i| QueueItem { item_id: format!("{p}{i:031}"), track_id: format!("{i:09}") }).collect();
+        w.host.queue_op(OpKind::Replace { items: big("a") }).unwrap();
+        w.host.queue_op(OpKind::Replace { items: big("b") }).unwrap();
+        let out = w.host.on_message("g", Msg::Resync { have: 0 }, S);
+        assert!(matches!(out[0].msg, Msg::Snapshot(_)), "{:?}", out[0].msg);
+        assert!(out.iter().all(|o| super::super::proto::encode(&o.msg).is_ok()));
     }
 
     #[test]

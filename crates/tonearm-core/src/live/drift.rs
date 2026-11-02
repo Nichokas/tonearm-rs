@@ -26,6 +26,9 @@ pub struct DriftController {
     last_correction_ns: Option<i64>,
     /// Direction of the active nudge: `1` faster, `-1` slower, `0` none.
     nudging: i8,
+    /// A nudge was forgotten by [`Self::reset`] while the player may still run
+    /// at the nudged rate: the next decision restores 1.0 first.
+    rate_dirty: bool,
     /// Seek only (low power mode, or a player without rate control).
     pub seek_only: bool,
 }
@@ -40,6 +43,10 @@ impl DriftController {
     pub fn decide(&mut self, expected_ms: i64, actual_ms: i64, now_ns: i64) -> Correction {
         let err = expected_ms - actual_ms; // > 0: we are behind
         let abs = err.abs();
+        if self.rate_dirty && !(abs > SEEK_MS || self.seek_only) {
+            self.rate_dirty = false;
+            return Correction::Rate(1.0);
+        }
         if abs < DEADBAND_MS {
             if self.nudging != 0 {
                 self.nudging = 0;
@@ -54,6 +61,7 @@ impl DriftController {
             }
             self.last_correction_ns = Some(now_ns);
             self.nudging = 0;
+            self.rate_dirty = false;
             return Correction::Seek(expected_ms.max(0));
         }
         let dir: i8 = if err > 0 { 1 } else { -1 };
@@ -77,6 +85,7 @@ impl DriftController {
     /// Forget hysteresis (new track, seek by host, resume after interruption).
     pub fn reset(&mut self) {
         self.last_correction_ns = None;
+        self.rate_dirty |= self.nudging != 0;
         self.nudging = 0;
     }
 }
@@ -159,6 +168,15 @@ mod tests {
         assert_eq!(d.decide(10_100, 10_000, 0), Correction::Rate(1.02));
         assert_eq!(d.decide(10_000, 10_100, 1), Correction::Rate(0.98));
         assert_eq!(d.decide(10_000, 10_100, 2), Correction::None);
+    }
+
+    #[test]
+    fn reset_during_nudge_restores_rate() {
+        let mut d = DriftController::new();
+        assert_eq!(d.decide(10_100, 10_000, 0), Correction::Rate(1.02));
+        d.reset(); // pause / reconnect
+        assert_eq!(d.decide(10_010, 10_000, S), Correction::Rate(1.0));
+        assert_eq!(d.decide(10_010, 10_000, 2 * S), Correction::None);
     }
 
     #[test]
