@@ -213,7 +213,6 @@ fn fail(err: &str) {
 
 /// Ends (host) or leaves (guest) the current session.
 pub fn end() {
-    next_generation();
     match SESSION.with(|s| s.borrow_mut().take()) {
         Some(Session::Host(h)) => drop(gio::spawn_blocking(move || h.end())),
         Some(Session::Guest(g)) => g.leave(),
@@ -230,7 +229,10 @@ pub fn dismiss() {
     }
 }
 
+/// Stops everything tied to the current session; bumping the generation
+/// also stops its timers and drops its late events.
 fn teardown() {
+    next_generation();
     let was_guest = matches!(SESSION.with(|s| s.borrow_mut().take()), Some(Session::Guest(_))) || phase().get().is_guest();
     CURRENT_ITEM.with(|c| c.borrow_mut().take());
     drop(LOADS.with(RefCell::take));
