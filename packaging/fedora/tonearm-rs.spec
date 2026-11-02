@@ -81,8 +81,10 @@ install -Dm0644 internal/icons/hicolor/scalable/apps/%{appid}.svg \
     %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/%{appid}.svg
 install -Dm0644 internal/icons/hicolor/symbolic/apps/%{appid}-symbolic.svg \
     %{buildroot}%{_datadir}/icons/hicolor/symbolic/apps/%{appid}-symbolic.svg
-install -Dm0644 internal/icons/hicolor/128x128/apps/%{appid}.png \
-    %{buildroot}%{_datadir}/icons/hicolor/128x128/apps/%{appid}.png
+for size in 16 24 32 48 64 128 256 512; do
+    install -Dm0644 internal/icons/hicolor/${size}x${size}/apps/%{appid}.png \
+        %{buildroot}%{_datadir}/icons/hicolor/${size}x${size}/apps/%{appid}.png
+done
 install -Dm0644 build/%{appid}.desktop %{buildroot}%{_datadir}/applications/%{appid}.desktop
 install -Dm0644 build/%{appid}.metainfo.xml %{buildroot}%{_metainfodir}/%{appid}.metainfo.xml
 install -Dm0644 internal/settings/%{appid}.gschema.xml \
@@ -102,7 +104,14 @@ glib-compile-schemas --strict --dry-run %{buildroot}%{_datadir}/glib-2.0/schemas
 %{_datadir}/glib-2.0/schemas/%{appid}.gschema.xml
 %{_datadir}/icons/hicolor/scalable/apps/%{appid}.svg
 %{_datadir}/icons/hicolor/symbolic/apps/%{appid}-symbolic.svg
+%{_datadir}/icons/hicolor/16x16/apps/%{appid}.png
+%{_datadir}/icons/hicolor/24x24/apps/%{appid}.png
+%{_datadir}/icons/hicolor/32x32/apps/%{appid}.png
+%{_datadir}/icons/hicolor/48x48/apps/%{appid}.png
+%{_datadir}/icons/hicolor/64x64/apps/%{appid}.png
 %{_datadir}/icons/hicolor/128x128/apps/%{appid}.png
+%{_datadir}/icons/hicolor/256x256/apps/%{appid}.png
+%{_datadir}/icons/hicolor/512x512/apps/%{appid}.png
 
 %changelog
 * Sat Oct 31 2026 tonearm-rs CI <noreply@github.com> - 1.1.0-1
