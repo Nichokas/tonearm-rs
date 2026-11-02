@@ -6,6 +6,7 @@
 mod api;
 mod cache;
 mod imgutil;
+mod live;
 mod player;
 mod router;
 mod scrobbling;
@@ -98,15 +99,20 @@ fn main() -> glib::ExitCode {
         }
         if args.len() == 2 {
             let url = args[1].to_string_lossy().to_string();
-            if let Some(id) = url.strip_prefix("tidal://track/") {
-                let id = id.to_string();
-                glib::spawn_future_local(async move {
-                    if let Err(e) = player::play_track_id(&id).await {
-                        log::error!("failed to play track error={e:#}");
-                    }
-                });
-            } else {
-                router::navigate(&url);
+            match live::link::classify(&url) {
+                live::link::Arg::Join(link) => live::join(&link),
+                live::link::Arg::BadInvitation(e) => {
+                    log::warn!("ignoring invalid Listen Together link error={e}");
+                    player::toasts().notify(&i18n::tr("This invitation link is not valid"));
+                }
+                live::link::Arg::TidalTrack(id) => {
+                    glib::spawn_future_local(async move {
+                        if let Err(e) = player::play_track_id(&id).await {
+                            log::error!("failed to play track error={e:#}");
+                        }
+                    });
+                }
+                live::link::Arg::Route(route) => router::navigate(&route),
             }
         }
         glib::ExitCode::SUCCESS

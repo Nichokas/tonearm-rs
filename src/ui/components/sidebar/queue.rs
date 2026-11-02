@@ -126,5 +126,6 @@ pub fn new_queue() -> gtk::Box {
     let u = Rc::clone(&update);
     on_state(player::user_queue().entries(), &bin, move |b, _| u(b));
     on_state(player::base_queue().entries(), &bin, move |b, _| update(b));
-    vstack(&[mini.upcast_ref(), bin.upcast_ref()])
+    let listen = super::live::new_button().hmargin(12).mtop(6);
+    vstack(&[listen.upcast_ref(), mini.upcast_ref(), bin.upcast_ref()])
 }

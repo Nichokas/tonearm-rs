@@ -11,7 +11,7 @@ categories = ["multimedia::audio", "gui"]
 publish = false
 
 [dependencies]
-tonearm-core = { path = "crates/tonearm-core" }
+tonearm-core = { path = "crates/tonearm-core", features = ["live-net"] }
 adw = { version = "0.9.2", package = "libadwaita", features = ["v1_8"] }
 anyhow = "1.0.104"
 async-channel = "2.5.0"
@@ -19,7 +19,7 @@ base64 = "0.23.1"
 chrono = "0.4.45"
 env_logger = "0.11.11"
 glib = "0.22"
-gst = { version = "0.25.4", package = "gstreamer" }
+gst = { version = "0.25.4", package = "gstreamer", features = ["v1_18"] }
 gst_audio = { version = "0.25.4", package = "gstreamer-audio" }
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_20"] }
 libsecret = "0.9.0"

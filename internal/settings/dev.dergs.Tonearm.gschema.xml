@@ -90,6 +90,12 @@
 			<summary>Volume</summary>
 			<description>The last configured volume level</description>
 		</key>
+		<key name="live-output-delay" type="i">
+			<range min="0" max="1000"/>
+			<default>0</default>
+			<summary>Listen Together output delay</summary>
+			<description>Extra delay in milliseconds added when following a Listen Together host, to compensate slow audio outputs such as Bluetooth</description>
+		</key>
     </schema>
 
 	<!-- Scrobbling -->

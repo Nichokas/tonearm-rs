@@ -1,4 +1,5 @@
 //! Port of `components/sidebar`.
+pub mod live;
 pub mod lyrics;
 pub mod player_view;
 pub mod queue;
