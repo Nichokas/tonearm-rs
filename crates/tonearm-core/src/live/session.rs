@@ -62,7 +62,10 @@ impl HostSession {
         Self {
             session_id: new_id(),
             secret: new_id(),
-            name,
+            name: match name.char_indices().nth(40) {
+                Some((cut, _)) => name[..cut].to_owned(),
+                None => name,
+            },
             // Distinct per run so a restarted host always wins over stale state.
             epoch: u64::try_from(now_ns.max(0)).unwrap_or(0) ^ u64::from(rand::random::<u32>()) | 1,
             queue: HostQueue::new(),
@@ -750,5 +753,28 @@ mod tests {
         assert_eq!(w.guest.correction(local, 0, 10_000), Correction::None);
         assert_eq!(w.guest.correction(local, 0, 9_900), Correction::Rate(1.02));
         assert_eq!(w.guest.correction(local + 10 * MS, 0, 5_000), Correction::Seek(10_010));
+    }
+
+    #[test]
+    fn worst_case_welcome_and_snapshot_fit_frame() {
+        use crate::live::queue::{QueueItem, MAX_ID_LEN};
+        use crate::live::MAX_QUEUE;
+        let mut h = HostSession::new("\u{0}".repeat(500), 0);
+        let items: Vec<QueueItem> = (0..MAX_QUEUE)
+            .map(|i| QueueItem { item_id: format!("{i:0>MAX_ID_LEN$}"), track_id: "9".repeat(MAX_ID_LEN) })
+            .collect();
+        h.queue_op(OpKind::Replace { items }).unwrap();
+        h.set_playback(Some("x".repeat(MAX_ID_LEN)), Some("y".repeat(MAX_ID_LEN)), i64::MAX, true, 0);
+        let w = h.on_message("p", Msg::Hello { proto: PROTO_VERSION, secret: h.secret.clone(), name: "g".into() }, 0);
+        assert!(matches!(&w[0].msg, Msg::Welcome { .. }));
+        crate::live::proto::encode(&w[0].msg).unwrap();
+        for o in &h.on_message("p", Msg::Resync { have: 0 }, 0) {
+            crate::live::proto::encode(&o.msg).unwrap();
+        }
+        // Oversized or escaping ids are rejected on ingest.
+        let bad = vec![QueueItem { item_id: "a".repeat(MAX_ID_LEN + 1), track_id: "t".into() }];
+        assert_eq!(h.queue_op(OpKind::Replace { items: bad }), Err(QueueError::InvalidItem));
+        let bad = vec![QueueItem { item_id: "a\"b".into(), track_id: "t".into() }];
+        assert_eq!(h.queue_op(OpKind::Replace { items: bad }), Err(QueueError::InvalidItem));
     }
 }

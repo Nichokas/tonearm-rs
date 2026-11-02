@@ -11,6 +11,21 @@ use serde::{Deserialize, Serialize};
 
 use super::MAX_QUEUE;
 
+/// Longest `item_id` / `track_id` accepted (bytes). Together with the ASCII
+/// charset this bounds a full snapshot well under `MAX_FRAME`.
+pub const MAX_ID_LEN: usize = 40;
+
+/// Ids are short ASCII tokens (no JSON escaping, bounded size).
+fn valid_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_ID_LEN && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
+}
+
+impl QueueItem {
+    pub fn is_valid(&self) -> bool {
+        valid_id(&self.item_id) && valid_id(&self.track_id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueItem {
     pub item_id: String,
@@ -56,6 +71,8 @@ pub enum QueueError {
     UnknownItem(String),
     #[error("duplicate queue entry {0}")]
     DuplicateItem(String),
+    #[error("invalid queue entry id")]
+    InvalidItem,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -80,7 +97,7 @@ impl Queue {
     /// version that can still advance.
     pub fn valid_snapshot(s: &Snapshot) -> bool {
         let mut seen: HashSet<&str> = HashSet::new();
-        s.items.len() <= MAX_QUEUE && s.version < u64::MAX && s.items.iter().all(|i| seen.insert(&i.item_id))
+        s.items.len() <= MAX_QUEUE && s.version < u64::MAX && s.items.iter().all(|i| i.is_valid() && seen.insert(&i.item_id))
     }
 
     fn check_new(&self, items: &[QueueItem], existing: usize) -> Result<(), QueueError> {
@@ -89,6 +106,9 @@ impl Queue {
         }
         let mut seen: HashSet<&str> = HashSet::new();
         for it in items {
+            if !it.is_valid() {
+                return Err(QueueError::InvalidItem);
+            }
             if !seen.insert(&it.item_id) || (existing > 0 && self.pos(&it.item_id).is_some()) {
                 return Err(QueueError::DuplicateItem(it.item_id.clone()));
             }
