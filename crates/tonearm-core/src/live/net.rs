@@ -178,7 +178,30 @@ impl std::fmt::Debug for LiveHost {
 
 /// Accepted guests only: (connection token, sender). The token tells a
 /// reconnected guest's new connection apart from its old one.
-type Peers = Arc<Mutex<HashMap<String, (u64, mpsc::UnboundedSender<Msg>)>>>;
+type Peers = Arc<Mutex<HashMap<String, (u64, Outbox)>>>;
+
+/// Messages queued for one guest before it counts as too slow.
+const OUT_BUFFER: usize = 64;
+
+/// Bounded outbound queue of one guest connection. A guest that stops
+/// reading fills it; it is then disconnected instead of growing memory.
+#[derive(Debug, Clone)]
+struct Outbox {
+    tx: mpsc::Sender<Msg>,
+    kicked: Arc<Stop>,
+}
+
+impl Outbox {
+    fn new() -> (Self, mpsc::Receiver<Msg>) {
+        let (tx, rx) = mpsc::channel(OUT_BUFFER);
+        (Self { tx, kicked: Arc::default() }, rx)
+    }
+    fn send(&self, m: Msg) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(m) {
+            self.kicked.trigger();
+        }
+    }
+}
 
 fn next_token() -> u64 {
     static N: AtomicU64 = AtomicU64::new(1);
@@ -191,18 +214,18 @@ fn route(peers: &Peers, outs: Vec<super::session::Out>) {
 
 /// Like [`route`]; `own` delivers replies (e.g. `Reject`) to a connection
 /// that is not registered because its `Hello` was not accepted.
-fn route_from(peers: &Peers, outs: Vec<super::session::Out>, own: Option<(&str, &mpsc::UnboundedSender<Msg>)>) {
+fn route_from(peers: &Peers, outs: Vec<super::session::Out>, own: Option<(&str, &Outbox)>) {
     let p = peers.lock().unwrap_or_else(PoisonError::into_inner);
     for o in outs {
         match o.to {
-            To::All => p.values().for_each(|(_, tx)| drop(tx.send(o.msg.clone()))),
+            To::All => p.values().for_each(|(_, tx)| tx.send(o.msg.clone())),
             To::Peer(id) => {
                 if let Some((_, tx)) = p.get(&id) {
-                    drop(tx.send(o.msg));
+                    tx.send(o.msg);
                 } else if let Some((own_id, tx)) = own
                     && own_id == id
                 {
-                    drop(tx.send(o.msg));
+                    tx.send(o.msg);
                 }
             }
         }
@@ -312,7 +335,7 @@ impl LiveHost {
 async fn serve_guest(conn: Connection, state: Arc<Mutex<HostSession>>, peers: Peers, listener: Arc<dyn LiveListener>) {
     let peer = conn.remote_id().to_string();
     let Ok((mut send, mut recv)) = conn.accept_bi().await else { return };
-    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    let (tx, mut rx) = Outbox::new();
     let token = next_token();
     let mut registered = false;
     let writer = tokio::spawn(async move {
@@ -328,7 +351,13 @@ async fn serve_guest(conn: Connection, state: Arc<Mutex<HostSession>>, peers: Pe
         }
     });
     let mut known = 0;
-    while let Ok(m) = read_msg(&mut recv).await {
+    loop {
+        // Dropping a half-read frame is fine here: a kicked guest is gone.
+        let m = tokio::select! {
+            m = read_msg(&mut recv) => m,
+            () = tx.kicked.wait() => break,
+        };
+        let Ok(m) = m else { break };
         let now = mono_now_ns();
         // Snapshot (Welcome), registration and routing happen under the
         // state lock, and every other sender routes under it too, so no
@@ -349,6 +378,9 @@ async fn serve_guest(conn: Connection, state: Arc<Mutex<HostSession>>, peers: Pe
             known = guests.len();
             listener.on_event(LiveEvent::Guests(guests));
         }
+    }
+    if tx.kicked.is_set() {
+        conn.close(1u32.into(), b"too slow");
     }
     drop(tx);
     // A newer connection from the same guest may own the entry by now.
@@ -587,8 +619,25 @@ mod tests {
         assert_eq!(only.relay_mode(), RelayMode::Default);
     }
 
-    fn sender() -> mpsc::UnboundedSender<Msg> {
-        mpsc::unbounded_channel().0
+    fn sender() -> Outbox {
+        Outbox::new().0
+    }
+
+    #[test]
+    fn guest_that_stops_reading_is_kicked() {
+        let (out, mut rx) = Outbox::new();
+        for _ in 0..OUT_BUFFER {
+            out.send(Msg::Bye);
+        }
+        assert!(!out.kicked.is_set(), "a full but not overflowing buffer is fine");
+        out.send(Msg::Bye);
+        assert!(out.kicked.is_set(), "overflow disconnects the guest");
+        // Memory stays bounded: nothing beyond the buffer was queued.
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, OUT_BUFFER);
     }
 
     #[test]
@@ -606,9 +655,9 @@ mod tests {
     #[test]
     fn unaccepted_connection_gets_only_its_own_replies() {
         let peers: Peers = Arc::default();
-        let (atx, mut arx) = mpsc::unbounded_channel();
+        let (atx, mut arx) = Outbox::new();
         peers.lock().unwrap().insert("accepted".into(), (1, atx));
-        let (utx, mut urx) = mpsc::unbounded_channel();
+        let (utx, mut urx) = Outbox::new();
         let outs = vec![
             super::super::session::Out { to: To::All, msg: Msg::Bye },
             super::super::session::Out { to: To::Peer("stranger".into()), msg: Msg::Reject { reason: RejectReason::BadSecret, proto: PROTO_VERSION } },

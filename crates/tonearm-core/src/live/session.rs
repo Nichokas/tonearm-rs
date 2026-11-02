@@ -55,6 +55,8 @@ pub struct HostSession {
     last_anchor_sent_ns: i64,
     last_heartbeat_ns: i64,
     guests: BTreeMap<String, GuestInfo>,
+    /// Last answered `Resync` per guest (see [`RESYNC_MIN_NS`]).
+    last_resync_ns: BTreeMap<String, i64>,
 }
 
 impl HostSession {
@@ -74,6 +76,7 @@ impl HostSession {
             last_anchor_sent_ns: i64::MIN / 2,
             last_heartbeat_ns: now_ns,
             guests: BTreeMap::new(),
+            last_resync_ns: BTreeMap::new(),
         }
         .with_epoch()
     }
@@ -116,16 +119,23 @@ impl HostSession {
             }
             _ if !self.guests.contains_key(peer) => Vec::new(), // must say Hello first
             Msg::Ping { id, t0 } => vec![to(peer, Msg::Pong { id, t0, t1: now_ns, t2: now_ns })],
-            Msg::Resync { have } => match self.queue.ops_since(have).filter(|ops| fits_frame(ops)) {
+            // At most one answer per guest per RESYNC_MIN_NS: a guest asking
+            // for full snapshots in a loop cannot make the host buffer them.
+            Msg::Resync { .. } if self.last_resync_ns.get(peer).is_some_and(|t| now_ns - t < RESYNC_MIN_NS) => Vec::new(),
+            Msg::Resync { have } => {
+                self.last_resync_ns.insert(peer.to_owned(), now_ns);
+                match self.queue.ops_since(have).filter(|ops| fits_frame(ops)) {
                 Some(ops) => {
                     let mut v = vec![to(peer, Msg::Ops { ops })];
                     v.push(to(peer, Msg::Anchor(self.anchor.clone())));
                     v
                 }
                 None => vec![to(peer, Msg::Snapshot(self.queue.snapshot())), to(peer, Msg::Anchor(self.anchor.clone()))],
-            },
+                }
+            }
             Msg::Bye => {
                 self.guests.remove(peer);
+                self.last_resync_ns.remove(peer);
                 Vec::new()
             }
             // Guests cannot send host messages.
@@ -135,6 +145,7 @@ impl HostSession {
 
     pub fn peer_disconnected(&mut self, peer: &str) {
         self.guests.remove(peer);
+        self.last_resync_ns.remove(peer);
     }
 
     /// Host player state changed (play, pause, seek, new track). Coalesced
@@ -224,6 +235,9 @@ pub const BURST_INTERVAL_NS: i64 = 150_000_000;
 pub const PING_INTERVAL_NS: i64 = 3_000_000_000;
 /// A queue gap older than this triggers a resync request.
 pub const GAP_TIMEOUT_NS: i64 = 2_000_000_000;
+/// Minimum time between two answered `Resync`s from one guest. Below
+/// [`GAP_TIMEOUT_NS`], so an honest guest's retry is always answered.
+pub const RESYNC_MIN_NS: i64 = 500_000_000;
 
 #[derive(Debug)]
 pub struct GuestSession {
@@ -493,6 +507,23 @@ mod tests {
 
     const MS: i64 = 1_000_000;
     const S: i64 = 1_000 * MS;
+
+    #[test]
+    fn resync_spam_is_rate_limited() {
+        let mut h = HostSession::new("Host".into(), 0);
+        let secret = h.secret.clone();
+        h.on_message("g", Msg::Hello { proto: PROTO_VERSION, secret, name: "G".into() }, 0);
+        h.queue_op(OpKind::Replace { items: items(3) }).unwrap();
+        let snaps = |o: &[Out]| o.iter().filter(|o| matches!(o.msg, Msg::Snapshot(_))).count();
+        let mut answered = 0;
+        // 100 requests within 100 ms: only the first is answered.
+        for i in 0..100 {
+            answered += snaps(&h.on_message("g", Msg::Resync { have: u64::MAX }, S + i * MS));
+        }
+        assert_eq!(answered, 1);
+        // A retry after the guest's own gap timeout is answered.
+        assert_eq!(snaps(&h.on_message("g", Msg::Resync { have: u64::MAX }, S + GAP_TIMEOUT_NS)), 1);
+    }
 
     fn items(n: usize) -> Vec<QueueItem> {
         (0..n).map(|i| QueueItem { item_id: format!("i{i}"), track_id: format!("t{i}") }).collect()
