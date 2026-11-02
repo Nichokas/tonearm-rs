@@ -8,6 +8,7 @@
 #![allow(clippy::clone_on_ref_ptr, clippy::semicolon_outside_block, clippy::needless_pass_by_value, reason = "async task wiring: clones move into spawned tasks")]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -94,6 +95,52 @@ async fn read_msg(recv: &mut RecvStream) -> Result<Msg, NetError> {
     proto::decode(&body).map_err(net)
 }
 
+/// One-shot stop signal. Unlike a bare `Notify::notify_waiters`, a task
+/// that starts waiting after the signal still sees it.
+#[derive(Debug, Default)]
+struct Stop {
+    flag: AtomicBool,
+    n: tokio::sync::Notify,
+}
+
+impl Stop {
+    /// Returns true the first time only.
+    fn trigger(&self) -> bool {
+        let first = !self.flag.swap(true, Ordering::SeqCst);
+        self.n.notify_waiters();
+        first
+    }
+    fn is_set(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+    async fn wait(&self) {
+        loop {
+            let f = self.n.notified();
+            tokio::pin!(f);
+            f.as_mut().enable();
+            if self.is_set() {
+                return;
+            }
+            f.await;
+        }
+    }
+}
+
+/// Reads whole messages in their own task, so callers can `select!` on the
+/// channel without cancelling a half-read frame (`read_exact` is not
+/// cancel-safe).
+fn spawn_reader(mut recv: RecvStream) -> (mpsc::UnboundedReceiver<Msg>, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let h = tokio::spawn(async move {
+        while let Ok(m) = read_msg(&mut recv).await {
+            if tx.send(m).is_err() {
+                break;
+            }
+        }
+    });
+    (rx, h)
+}
+
 /// Everything the UI needs to hear about.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveEvent {
@@ -112,10 +159,10 @@ pub trait LiveListener: Send + Sync {
 
 pub struct LiveHost {
     state: Arc<Mutex<HostSession>>,
-    peers: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Msg>>>>,
+    peers: Peers,
     endpoint: Endpoint,
     ticket: Ticket,
-    stop: Arc<tokio::sync::Notify>,
+    stop: Arc<Stop>,
 }
 
 impl std::fmt::Debug for LiveHost {
@@ -124,19 +171,47 @@ impl std::fmt::Debug for LiveHost {
     }
 }
 
-type Peers = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Msg>>>>;
+/// Accepted guests only: (connection token, sender). The token tells a
+/// reconnected guest's new connection apart from its old one.
+type Peers = Arc<Mutex<HashMap<String, (u64, mpsc::UnboundedSender<Msg>)>>>;
+
+fn next_token() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
 
 fn route(peers: &Peers, outs: Vec<super::session::Out>) {
+    route_from(peers, outs, None);
+}
+
+/// Like [`route`]; `own` delivers replies (e.g. `Reject`) to a connection
+/// that is not registered because its `Hello` was not accepted.
+fn route_from(peers: &Peers, outs: Vec<super::session::Out>, own: Option<(&str, &mpsc::UnboundedSender<Msg>)>) {
     let p = peers.lock().unwrap_or_else(PoisonError::into_inner);
     for o in outs {
         match o.to {
-            To::All => p.values().for_each(|tx| drop(tx.send(o.msg.clone()))),
+            To::All => p.values().for_each(|(_, tx)| drop(tx.send(o.msg.clone()))),
             To::Peer(id) => {
-                if let Some(tx) = p.get(&id) {
+                if let Some((_, tx)) = p.get(&id) {
+                    drop(tx.send(o.msg));
+                } else if let Some((own_id, tx)) = own
+                    && own_id == id
+                {
                     drop(tx.send(o.msg));
                 }
             }
         }
+    }
+}
+
+/// Removes `peer` only if `token` still owns it. Returns whether it did.
+fn unregister(peers: &Peers, peer: &str, token: u64) -> bool {
+    let mut p = peers.lock().unwrap_or_else(PoisonError::into_inner);
+    if p.get(peer).is_some_and(|(t, _)| *t == token) {
+        p.remove(peer);
+        true
+    } else {
+        false
     }
 }
 
@@ -152,13 +227,13 @@ impl LiveHost {
             let addr = serde_json::to_string(&endpoint.addr()).map_err(net)?;
             let ticket = Ticket { v: PROTO_VERSION, addr, secret, name: Some(name) };
             let peers: Peers = Arc::default();
-            let stop = Arc::new(tokio::sync::Notify::new());
+            let stop = Arc::new(Stop::default());
             // Accept loop.
             {
                 let (ep, state, peers, listener, stop) = (endpoint.clone(), state.clone(), peers.clone(), listener.clone(), stop.clone());
                 tokio::spawn(async move {
                     loop {
-                        let inc = tokio::select! { i = ep.accept() => i, () = stop.notified() => None };
+                        let inc = tokio::select! { i = ep.accept() => i, () = stop.wait() => None };
                         let Some(inc) = inc else { break };
                         let (state, peers, listener) = (state.clone(), peers.clone(), listener.clone());
                         tokio::spawn(async move {
@@ -175,7 +250,7 @@ impl LiveHost {
                 tokio::spawn(async move {
                     let mut iv = tokio::time::interval(Duration::from_millis(250));
                     loop {
-                        tokio::select! { _ = iv.tick() => {}, () = stop.notified() => break }
+                        tokio::select! { _ = iv.tick() => {}, () = stop.wait() => break }
                         let outs = state.lock().unwrap_or_else(PoisonError::into_inner).tick(mono_now_ns());
                         route(&peers, outs);
                     }
@@ -209,9 +284,11 @@ impl LiveHost {
 
     /// Ends the session for everyone.
     pub fn end(&self) {
+        if !self.stop.trigger() {
+            return;
+        }
         let outs = self.state.lock().unwrap_or_else(PoisonError::into_inner).end();
         route(&self.peers, outs);
-        self.stop.notify_waiters();
         let ep = self.endpoint.clone();
         runtime().spawn(async move {
             // Let the End message flush before closing.
@@ -225,7 +302,8 @@ async fn serve_guest(conn: Connection, state: Arc<Mutex<HostSession>>, peers: Pe
     let peer = conn.remote_id().to_string();
     let Ok((mut send, mut recv)) = conn.accept_bi().await else { return };
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
-    peers.lock().unwrap_or_else(PoisonError::into_inner).insert(peer.clone(), tx);
+    let token = next_token();
+    let mut registered = false;
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
             let end = matches!(m, Msg::End { .. } | Msg::Reject { .. });
@@ -246,13 +324,23 @@ async fn serve_guest(conn: Connection, state: Arc<Mutex<HostSession>>, peers: Pe
             let outs = s.on_message(&peer, m, now);
             (outs, s.guests())
         };
-        route(&peers, outs);
+        // Broadcasts reach a connection only once its Hello is accepted.
+        if !registered && guests.iter().any(|g| g.peer == peer) {
+            registered = true;
+            peers.lock().unwrap_or_else(PoisonError::into_inner).insert(peer.clone(), (token, tx.clone()));
+        }
+        route_from(&peers, outs, Some((&peer, &tx)));
         if guests.len() != known {
             known = guests.len();
             listener.on_event(LiveEvent::Guests(guests));
         }
     }
-    peers.lock().unwrap_or_else(PoisonError::into_inner).remove(&peer);
+    drop(tx);
+    // A newer connection from the same guest may own the entry by now.
+    if !registered || !unregister(&peers, &peer, token) {
+        writer.abort();
+        return;
+    }
     let guests = {
         let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
         s.peer_disconnected(&peer);
@@ -262,12 +350,20 @@ async fn serve_guest(conn: Connection, state: Arc<Mutex<HostSession>>, peers: Pe
     writer.abort();
 }
 
+impl Drop for LiveHost {
+    /// Releasing the handle (e.g. Swift ARC) ends the session.
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
 // ---------------------------------------------------------------- guest
 
 pub struct LiveGuest {
     state: Arc<Mutex<GuestSession>>,
     tx: Arc<Mutex<Option<mpsc::UnboundedSender<Msg>>>>,
-    stop: Arc<tokio::sync::Notify>,
+    stop: Arc<Stop>,
+    left: AtomicBool,
 }
 
 impl std::fmt::Debug for LiveGuest {
@@ -288,7 +384,7 @@ impl LiveGuest {
         let addr: EndpointAddr = serde_json::from_str(&ticket.addr).map_err(|_e| NetError::Ticket(super::ticket::TicketError::Malformed))?;
         let state = Arc::new(Mutex::new(GuestSession::new(ticket.secret, name, mono_now_ns())));
         let tx: Arc<Mutex<Option<mpsc::UnboundedSender<Msg>>>> = Arc::default();
-        let stop = Arc::new(tokio::sync::Notify::new());
+        let stop = Arc::new(Stop::default());
         let cfg = cfg.clone();
         {
             let (state, tx, stop, listener) = (state.clone(), tx.clone(), stop.clone(), listener.clone());
@@ -308,9 +404,11 @@ impl LiveGuest {
                     if !first {
                         listener.on_event(LiveEvent::Reconnecting);
                     }
+                    // The host timeout keeps running while we dial.
                     let attempt = tokio::select! {
                         r = tokio::time::timeout(Duration::from_secs(8), ep.connect(addr.clone(), ALPN)) => r,
-                        () = stop.notified() => break,
+                        () = watch_timeout(&state, &listener) => break,
+                        () = stop.wait() => break,
                     };
                     if let Ok(Ok(conn)) = attempt
                         && let Ok((send, recv)) = conn.open_bi().await
@@ -326,12 +424,12 @@ impl LiveGuest {
                     // The session's own timeout (no host for 10 s) ends it.
                     let (_, ev) = state.lock().unwrap_or_else(PoisonError::into_inner).tick(mono_now_ns());
                     ev.into_iter().for_each(|e| listener.on_event(LiveEvent::Guest(e)));
-                    tokio::select! { () = tokio::time::sleep(Duration::from_secs(1)) => {}, () = stop.notified() => break }
+                    tokio::select! { () = tokio::time::sleep(Duration::from_secs(1)) => {}, () = stop.wait() => break }
                 }
                 ep.close().await;
             });
         }
-        Ok(Self { state, tx, stop })
+        Ok(Self { state, tx, stop, left: AtomicBool::new(false) })
     }
 
     /// Where the local player should be (`latency_ms`: output latency +
@@ -364,6 +462,9 @@ impl LiveGuest {
     }
 
     pub fn leave(&self) {
+        if self.left.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let msgs = self.state.lock().unwrap_or_else(PoisonError::into_inner).leave();
         if let Some(tx) = self.tx.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
             msgs.into_iter().for_each(|m| drop(tx.send(m)));
@@ -371,19 +472,47 @@ impl LiveGuest {
         let stop = self.stop.clone();
         runtime().spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            stop.notify_waiters();
+            stop.trigger();
         });
+    }
+}
+
+impl Drop for LiveGuest {
+    /// Releasing the handle (e.g. Swift ARC) leaves the session.
+    fn drop(&mut self) {
+        self.leave();
+    }
+}
+
+/// Ticks the guest session every 250 ms; returns once it has finished
+/// (host timeout, end or reject), emitting its events.
+async fn watch_timeout(state: &Arc<Mutex<GuestSession>>, listener: &Arc<dyn LiveListener>) {
+    let mut iv = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        iv.tick().await;
+        let ev = {
+            let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
+            let (_, ev) = s.tick(mono_now_ns());
+            if !finished(&s) && ev.is_empty() {
+                continue;
+            }
+            (ev, finished(&s))
+        };
+        ev.0.into_iter().for_each(|e| listener.on_event(LiveEvent::Guest(e)));
+        if ev.1 {
+            return;
+        }
     }
 }
 
 async fn run_guest_conn(
     mut send: SendStream,
-    mut recv: RecvStream,
+    recv: RecvStream,
     hello: Vec<Msg>,
     state: &Arc<Mutex<GuestSession>>,
     tx_slot: &Arc<Mutex<Option<mpsc::UnboundedSender<Msg>>>>,
     listener: &Arc<dyn LiveListener>,
-    stop: &Arc<tokio::sync::Notify>,
+    stop: &Arc<Stop>,
 ) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     *tx_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx.clone());
@@ -401,11 +530,12 @@ async fn run_guest_conn(
         }
     });
     let emit = |ev: Vec<GuestEvent>| ev.into_iter().for_each(|e| listener.on_event(LiveEvent::Guest(e)));
+    let (mut inbox, reader) = spawn_reader(recv);
     let mut iv = tokio::time::interval(Duration::from_millis(100));
     loop {
         tokio::select! {
-            m = read_msg(&mut recv) => {
-                let Ok(m) = m else { break };
+            m = inbox.recv() => {
+                let Some(m) = m else { break };
                 let (out, ev) = state.lock().unwrap_or_else(PoisonError::into_inner).on_message(m, mono_now_ns());
                 out.into_iter().for_each(|m| drop(tx.send(m)));
                 emit(ev);
@@ -415,12 +545,13 @@ async fn run_guest_conn(
                 out.into_iter().for_each(|m| drop(tx.send(m)));
                 emit(ev);
             }
-            () = stop.notified() => break,
+            () = stop.wait() => break,
         }
         if finished(&state.lock().unwrap_or_else(PoisonError::into_inner)) {
             break;
         }
     }
+    reader.abort();
     *tx_slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
     drop(tx);
     drop(tokio::time::timeout(Duration::from_millis(500), writer).await);
@@ -439,6 +570,46 @@ mod tests {
         assert!(urls.iter().any(|u| u.as_str().contains("iroh-svc.com")));
         let only = NetConfig { relays: vec![], n0_fallback: false };
         assert_eq!(only.relay_mode(), RelayMode::Default);
+    }
+
+    fn sender() -> mpsc::UnboundedSender<Msg> {
+        mpsc::unbounded_channel().0
+    }
+
+    #[test]
+    fn stale_connection_does_not_remove_newer_one() {
+        let peers: Peers = Arc::default();
+        peers.lock().unwrap().insert("g".into(), (1, sender()));
+        // Guest reconnects: new connection (token 2) takes over the entry.
+        peers.lock().unwrap().insert("g".into(), (2, sender()));
+        assert!(!unregister(&peers, "g", 1), "old handler must not remove the new entry");
+        assert!(peers.lock().unwrap().contains_key("g"));
+        assert!(unregister(&peers, "g", 2));
+        assert!(peers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unaccepted_connection_gets_only_its_own_replies() {
+        let peers: Peers = Arc::default();
+        let (atx, mut arx) = mpsc::unbounded_channel();
+        peers.lock().unwrap().insert("accepted".into(), (1, atx));
+        let (utx, mut urx) = mpsc::unbounded_channel();
+        let outs = vec![
+            super::super::session::Out { to: To::All, msg: Msg::Bye },
+            super::super::session::Out { to: To::Peer("stranger".into()), msg: Msg::Reject { reason: RejectReason::BadSecret, proto: PROTO_VERSION } },
+        ];
+        route_from(&peers, outs, Some(("stranger", &utx)));
+        assert!(matches!(arx.try_recv(), Ok(Msg::Bye)));
+        assert!(matches!(urx.try_recv(), Ok(Msg::Reject { .. })), "reject reaches the caller");
+        assert!(urx.try_recv().is_err(), "broadcast does not reach an unaccepted connection");
+    }
+
+    #[test]
+    fn stop_seen_by_late_waiter() {
+        let stop = Stop::default();
+        assert!(stop.trigger());
+        assert!(!stop.trigger());
+        runtime().block_on(async { tokio::time::timeout(Duration::from_secs(1), stop.wait()).await.expect("late waiter sees stop") });
     }
 
     #[derive(Default)]

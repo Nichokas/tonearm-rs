@@ -130,6 +130,12 @@ impl LiveHost {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LiveQueueEntry {
+    pub item_id: String,
+    pub track_id: String,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct LiveTarget {
     pub item_id: Option<String>,
@@ -159,6 +165,11 @@ impl LiveGuest {
     }
     pub fn host_name(&self) -> String {
         self.0.host_name()
+    }
+    /// Shared queue in order; `item_id` matches [`LiveTarget::item_id`], so
+    /// repeated tracks can be told apart.
+    pub fn queue(&self) -> Vec<LiveQueueEntry> {
+        self.0.queue().into_iter().map(|i| LiveQueueEntry { item_id: i.item_id, track_id: i.track_id }).collect()
     }
     /// Shared queue as track ids, in order.
     pub fn queue_track_ids(&self) -> Vec<String> {
