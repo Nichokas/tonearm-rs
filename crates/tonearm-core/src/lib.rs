@@ -16,6 +16,7 @@ pub mod discover;
 pub mod explore;
 pub mod error;
 pub mod i18n;
+pub mod live;
 pub mod model;
 pub mod playqueue;
 pub mod scrobbling;
