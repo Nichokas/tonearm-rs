@@ -24,11 +24,15 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "b
 urlencoding = "2.1.3"
 thiserror = "2"
 url = "2"
+iroh = { version = "1.4", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"], optional = true }
 
 [features]
 default = ["tls-aws-lc"]
 # rustls with the aws-lc-rs provider (reqwest's default TLS).
 tls-aws-lc = ["reqwest/rustls"]
+# Listen Together transport (iroh QUIC, n0 / iroh services relays).
+live-net = ["dep:iroh", "dep:tokio"]
 
 [lints]
 workspace = true

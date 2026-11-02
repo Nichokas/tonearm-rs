@@ -15,6 +15,8 @@
 
 pub mod clock;
 pub mod drift;
+#[cfg(feature = "live-net")]
+pub mod net;
 pub mod proto;
 pub mod queue;
 pub mod session;

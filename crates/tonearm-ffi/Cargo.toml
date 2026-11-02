@@ -22,7 +22,7 @@ default = []
 bindgen = ["uniffi/cli"]
 
 [dependencies]
-tonearm-core = { path = "../tonearm-core" }
+tonearm-core = { path = "../tonearm-core", features = ["live-net"] }
 uniffi = "0.32"
 blocking = "1"
 thiserror = "2"
