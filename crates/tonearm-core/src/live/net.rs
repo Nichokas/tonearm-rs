@@ -384,12 +384,15 @@ async fn serve_guest(conn: Connection, state: Arc<Mutex<HostSession>>, peers: Pe
     }
     drop(tx);
     // A newer connection from the same guest may own the entry by now.
-    if !registered || !unregister(&peers, &peer, token) {
-        writer.abort();
-        return;
-    }
+    // Both removals happen under the state lock (order state -> peers), so
+    // a reconnect's Hello cannot slip in between them.
     let guests = {
         let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if !registered || !unregister(&peers, &peer, token) {
+            drop(s);
+            writer.abort();
+            return;
+        }
         s.peer_disconnected(&peer);
         s.guests()
     };

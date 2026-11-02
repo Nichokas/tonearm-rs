@@ -256,6 +256,9 @@ pub struct GuestSession {
     outstanding: BTreeMap<u64, i64>,
     gap_since: Option<i64>,
     resync_sent_ns: Option<i64>,
+    /// A snapshot was requested and has not arrived; `tick` retries it
+    /// (the host may drop a request under [`RESYNC_MIN_NS`]).
+    need_snapshot: bool,
 }
 
 impl GuestSession {
@@ -276,6 +279,7 @@ impl GuestSession {
             outstanding: BTreeMap::new(),
             gap_since: None,
             resync_sent_ns: None,
+            need_snapshot: false,
         }
     }
 
@@ -353,6 +357,7 @@ impl GuestSession {
             }
             GuestApply::NeedSnapshot => {
                 self.gap_since = None;
+                self.need_snapshot = true;
                 // Version 0 is never in the log: forces a snapshot.
                 out.push(Msg::Resync { have: u64::MAX });
                 self.resync_sent_ns = Some(now_ns);
@@ -431,6 +436,7 @@ impl GuestSession {
             }
             Msg::Snapshot(s) => {
                 self.resync_sent_ns = None;
+                self.need_snapshot = false;
                 let before = self.queue.queue().version;
                 let r = self.queue.apply_snapshot(s);
                 self.queue_result(r, before, now_ns, &mut out, &mut ev);
@@ -472,6 +478,9 @@ impl GuestSession {
                 && self.resync_sent_ns.is_none_or(|t| now_ns - t > GAP_TIMEOUT_NS)
             {
                 out.push(Msg::Resync { have: self.queue.queue().version });
+                self.resync_sent_ns = Some(now_ns);
+            } else if self.need_snapshot && self.resync_sent_ns.is_none_or(|t| now_ns - t > GAP_TIMEOUT_NS) {
+                out.push(Msg::Resync { have: u64::MAX });
                 self.resync_sent_ns = Some(now_ns);
             }
         }
@@ -567,6 +576,28 @@ mod tests {
             let h = self.guest.hello();
             self.send_guest(vec![h], t);
         }
+    }
+
+    #[test]
+    fn dropped_snapshot_request_is_retried() {
+        use crate::live::queue::Snapshot;
+        let mut w = World::new(0, MS);
+        w.join(100 * S);
+        let resyncs = |m: &[Msg]| m.iter().filter(|m| matches!(m, Msg::Resync { have: u64::MAX })).count();
+        // An unusable snapshot makes the guest ask for a new one; the host
+        // drops that request (rate limit), so nothing comes back.
+        let t = 101 * S;
+        let (out, _) = w.guest.on_message(Msg::Snapshot(Snapshot { version: u64::MAX, items: vec![] }), t);
+        assert_eq!(resyncs(&out), 1);
+        let (out, _) = w.guest.tick(t + GAP_TIMEOUT_NS / 2);
+        assert_eq!(resyncs(&out), 0, "no retry before the timeout");
+        let (out, _) = w.guest.tick(t + GAP_TIMEOUT_NS + MS);
+        assert_eq!(resyncs(&out), 1, "retried after the timeout");
+        // A good snapshot stops the retries.
+        let good = w.host.queue.snapshot();
+        w.guest.on_message(Msg::Snapshot(good), t + GAP_TIMEOUT_NS + 2 * MS);
+        let (out, _) = w.guest.tick(t + 3 * GAP_TIMEOUT_NS);
+        assert_eq!(resyncs(&out), 0);
     }
 
     #[test]
