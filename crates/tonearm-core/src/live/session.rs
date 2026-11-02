@@ -133,7 +133,7 @@ impl HostSession {
     /// Host player state changed (play, pause, seek, new track). Coalesced
     /// within [`DEBOUNCE_NS`]; the rest goes out on [`Self::tick`].
     pub fn set_playback(&mut self, item_id: Option<String>, track_id: Option<String>, position_ms: i64, playing: bool, now_ns: i64) -> Vec<Out> {
-        let track_changed = item_id != self.anchor.item_id;
+        let track_changed = item_id != self.anchor.item_id || track_id != self.anchor.track_id;
         self.anchor = Anchor {
             epoch: self.epoch,
             seq: self.anchor.seq + 1,
@@ -307,7 +307,7 @@ impl GuestSession {
     fn take_anchor(&mut self, a: Anchor) -> bool {
         let newer = self.anchor.as_ref().is_none_or(|cur| a.is_newer_than(cur));
         if newer {
-            if self.anchor.as_ref().is_none_or(|cur| cur.item_id != a.item_id || !a.playing || !cur.playing) {
+            if self.anchor.as_ref().is_none_or(|cur| cur.item_id != a.item_id || cur.track_id != a.track_id || !a.playing || !cur.playing) {
                 self.drift.reset();
             }
             self.anchor = Some(a);
@@ -388,20 +388,26 @@ impl GuestSession {
                 self.queue_result(r, now_ns, &mut out, &mut ev);
             }
             Msg::Ops { ops } => {
-                let mut changed = false;
+                let before = self.queue.queue().version;
+                let mut last = GuestApply::Ignored;
                 for op in ops {
-                    match self.queue.apply(op) {
-                        GuestApply::Changed => changed = true,
-                        r @ GuestApply::NeedSnapshot => {
-                            self.queue_result(r, now_ns, &mut out, &mut ev);
-                            break;
-                        }
-                        _ => {}
+                    last = self.queue.apply(op);
+                    if last == GuestApply::NeedSnapshot {
+                        break;
                     }
                 }
                 self.resync_sent_ns = None;
-                if changed {
-                    self.queue_result(GuestApply::Changed, now_ns, &mut out, &mut ev);
+                let changed = self.queue.queue().version != before;
+                match last {
+                    GuestApply::NeedSnapshot | GuestApply::Gap { .. } => {
+                        if changed {
+                            ev.push(GuestEvent::QueueChanged);
+                        }
+                        // A gap left behind keeps its timer so `tick` resyncs.
+                        self.queue_result(last, now_ns, &mut out, &mut ev);
+                    }
+                    _ if changed => self.queue_result(GuestApply::Changed, now_ns, &mut out, &mut ev),
+                    _ => {}
                 }
             }
             Msg::Snapshot(s) => {
@@ -457,7 +463,7 @@ impl GuestSession {
     pub fn target(&self, now_ns: i64, latency_ms: i64) -> Option<Target> {
         let a = self.anchor.as_ref()?;
         let host_now = self.clock.to_host(now_ns)?;
-        let pos = a.position_at(host_now) + if a.playing { latency_ms } else { 0 };
+        let pos = a.position_at(host_now).saturating_add(if a.playing { latency_ms } else { 0 });
         Some(Target { item_id: a.item_id.clone(), track_id: a.track_id.clone(), position_ms: pos.max(0), playing: a.playing })
     }
 
@@ -590,6 +596,29 @@ mod tests {
         assert_eq!(a.position_ms, 9_000, "only the last seek goes out");
         // A track change is never delayed.
         assert_eq!(h.set_playback(Some("k".into()), None, 0, true, S + 310 * MS).len(), 1);
+    }
+
+    #[test]
+    fn track_change_without_item_id_is_not_debounced() {
+        let mut h = HostSession::new("H".into(), 0);
+        assert_eq!(h.set_playback(None, Some("t1".into()), 0, true, S).len(), 1);
+        assert_eq!(h.set_playback(None, Some("t2".into()), 0, true, S + MS).len(), 1);
+    }
+
+    #[test]
+    fn ops_batch_leaving_a_gap_keeps_resync_timer() {
+        use super::super::queue::{Op, VersionedOp};
+        let mut w = World::new(0, MS);
+        w.host.queue_op(OpKind::Replace { items: items(3) }).unwrap();
+        w.join(0);
+        let v = w.guest.queue_items().len();
+        assert_eq!(v, 3);
+        let have = 1; // snapshot version after one Replace
+        let mk = |ver: u64, id: &str| VersionedOp { version: ver, op: Op { op_id: id.into(), kind: OpKind::Remove { item_id: format!("i{}", ver - 2) } } };
+        let (_, ev) = w.guest.on_message(Msg::Ops { ops: vec![mk(have + 1, "a"), mk(have + 3, "c")] }, S);
+        assert!(ev.contains(&GuestEvent::QueueChanged), "{ev:?}");
+        let (out, _) = w.guest.tick(S + GAP_TIMEOUT_NS + 10 * MS);
+        assert!(out.iter().any(|m| matches!(m, Msg::Resync { .. })), "{out:?}");
     }
 
     #[test]

@@ -28,7 +28,8 @@ impl Anchor {
     /// Host position (ms) at host time `host_now_ns`.
     pub fn position_at(&self, host_now_ns: i64) -> i64 {
         if self.playing {
-            self.position_ms + (host_now_ns - self.host_mono_ns).max(0) / 1_000_000
+            // Saturating: anchors come from the network.
+            self.position_ms.saturating_add(host_now_ns.saturating_sub(self.host_mono_ns).max(0) / 1_000_000)
         } else {
             self.position_ms
         }
@@ -162,5 +163,11 @@ mod tests {
         assert_eq!(a.position_at(4_000_000_000), 1_000, "never runs backwards");
         let p = Anchor { playing: false, ..a };
         assert_eq!(p.position_at(60_000_000_000), 1_000);
+    }
+
+    #[test]
+    fn hostile_anchor_does_not_overflow() {
+        let a = Anchor { epoch: 0, seq: 0, queue_version: 0, item_id: None, track_id: None, position_ms: i64::MAX, host_mono_ns: i64::MIN, playing: true };
+        assert_eq!(a.position_at(i64::MAX), i64::MAX);
     }
 }

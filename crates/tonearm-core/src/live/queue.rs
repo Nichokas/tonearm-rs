@@ -76,6 +76,13 @@ impl Queue {
         }
     }
 
+    /// A snapshot from the network: within limits, unique item ids, and a
+    /// version that can still advance.
+    pub fn valid_snapshot(s: &Snapshot) -> bool {
+        let mut seen: HashSet<&str> = HashSet::new();
+        s.items.len() <= MAX_QUEUE && s.version < u64::MAX && s.items.iter().all(|i| seen.insert(&i.item_id))
+    }
+
     fn check_new(&self, items: &[QueueItem], existing: usize) -> Result<(), QueueError> {
         if existing + items.len() > MAX_QUEUE {
             return Err(QueueError::Full);
@@ -243,23 +250,32 @@ impl GuestQueue {
         if self.has_snapshot && s.version < self.queue.version {
             return GuestApply::Ignored;
         }
+        if !Queue::valid_snapshot(&s) {
+            return GuestApply::NeedSnapshot;
+        }
         self.queue = Queue { version: s.version, items: s.items };
         self.has_snapshot = true;
         let v = self.queue.version;
         self.pending.retain(|k, _| *k > v);
-        self.drain();
-        GuestApply::Changed
+        if !self.drain() {
+            return GuestApply::NeedSnapshot;
+        }
+        if self.pending.is_empty() { GuestApply::Changed } else { GuestApply::Gap { have: v } }
     }
 
     pub fn apply(&mut self, op: VersionedOp) -> GuestApply {
         if !self.has_snapshot {
             self.pending.insert(op.version, op);
+            if self.pending.len() > MAX_PENDING {
+                self.pending.clear();
+                return GuestApply::NeedSnapshot;
+            }
             return GuestApply::Gap { have: 0 };
         }
         if op.version <= self.queue.version {
             return GuestApply::Ignored;
         }
-        if op.version > self.queue.version + 1 {
+        if op.version - self.queue.version > 1 {
             self.pending.insert(op.version, op);
             if self.pending.len() > MAX_PENDING {
                 self.pending.clear();
@@ -279,7 +295,9 @@ impl GuestQueue {
 
     /// Applies buffered ops that now follow. `false` if one failed.
     fn drain(&mut self) -> bool {
-        while let Some(op) = self.pending.remove(&(self.queue.version + 1)) {
+        while let Some(next) = self.queue.version.checked_add(1)
+            && let Some(op) = self.pending.remove(&next)
+        {
             if self.queue.apply_kind(&op.op.kind).is_err() {
                 self.pending.clear();
                 return false;
@@ -483,5 +501,36 @@ mod tests {
         assert_eq!(g.apply(v), GuestApply::NeedSnapshot);
         assert_eq!(g.apply_snapshot(h.snapshot()), GuestApply::Changed);
         assert_eq!(g.queue(), h.queue());
+    }
+
+    #[test]
+    fn guest_rejects_invalid_snapshots() {
+        let mut g = GuestQueue::new();
+        let dup = Snapshot { version: 1, items: vec![it("a", "t"), it("a", "t")] };
+        assert_eq!(g.apply_snapshot(dup), GuestApply::NeedSnapshot);
+        let big = Snapshot { version: 1, items: (0..=MAX_QUEUE).map(|i| it(&format!("i{i}"), "t")).collect() };
+        assert_eq!(g.apply_snapshot(big), GuestApply::NeedSnapshot);
+        let max = Snapshot { version: u64::MAX, items: vec![] };
+        assert_eq!(g.apply_snapshot(max), GuestApply::NeedSnapshot);
+        assert!(!g.has_snapshot());
+    }
+
+    #[test]
+    fn snapshot_with_conflicting_buffered_op_needs_snapshot() {
+        let mut g = GuestQueue::new();
+        let bad = VersionedOp { version: 2, op: op("x", OpKind::Remove { item_id: "nope".into() }) };
+        assert_eq!(g.apply(bad), GuestApply::Gap { have: 0 });
+        let s = Snapshot { version: 1, items: vec![it("a", "t")] };
+        assert_eq!(g.apply_snapshot(s), GuestApply::NeedSnapshot);
+    }
+
+    #[test]
+    fn pending_before_snapshot_is_capped() {
+        let mut g = GuestQueue::new();
+        let mut last = GuestApply::Ignored;
+        for v in 1..=(MAX_PENDING as u64 + 1) {
+            last = g.apply(VersionedOp { version: v, op: op(&format!("o{v}"), OpKind::Clear) });
+        }
+        assert_eq!(last, GuestApply::NeedSnapshot);
     }
 }

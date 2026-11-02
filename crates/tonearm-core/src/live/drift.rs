@@ -11,18 +11,21 @@ pub const MIN_INTERVAL_NS: i64 = 2_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Correction {
-    /// Keep going (and restore rate 1.0 if it was nudged).
+    /// Change nothing: keep the current rate (a nudge may still be active;
+    /// its end is always reported explicitly as `Rate(1.0)`).
     None,
     /// Play at this rate until the next decision.
     Rate(f64),
-    /// Seek to this position (ms).
+    /// Seek to this position (ms) **and** play at rate 1.0: a seek always
+    /// cancels any active nudge.
     Seek(i64),
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DriftController {
     last_correction_ns: Option<i64>,
-    nudging: bool,
+    /// Direction of the active nudge: `1` faster, `-1` slower, `0` none.
+    nudging: i8,
     /// Seek only (low power mode, or a player without rate control).
     pub seek_only: bool,
 }
@@ -38,8 +41,8 @@ impl DriftController {
         let err = expected_ms - actual_ms; // > 0: we are behind
         let abs = err.abs();
         if abs < DEADBAND_MS {
-            if self.nudging {
-                self.nudging = false;
+            if self.nudging != 0 {
+                self.nudging = 0;
                 return Correction::Rate(1.0);
             }
             return Correction::None;
@@ -50,18 +53,21 @@ impl DriftController {
                 return Correction::None;
             }
             self.last_correction_ns = Some(now_ns);
-            self.nudging = false;
+            self.nudging = 0;
             return Correction::Seek(expected_ms.max(0));
         }
-        if self.nudging {
-            return Correction::None; // already correcting
+        let dir: i8 = if err > 0 { 1 } else { -1 };
+        if self.nudging == dir {
+            return Correction::None; // already correcting this way
         }
-        if self.too_soon(now_ns) {
+        // A flipped error (e.g. we overshot, or the host seeked) is corrected
+        // right away: holding the wrong-way nudge would only grow it.
+        if self.nudging == 0 && self.too_soon(now_ns) {
             return Correction::None;
         }
         self.last_correction_ns = Some(now_ns);
-        self.nudging = true;
-        Correction::Rate(if err > 0 { 1.0 + NUDGE } else { 1.0 - NUDGE })
+        self.nudging = dir;
+        Correction::Rate(1.0 + f64::from(dir) * NUDGE)
     }
 
     fn too_soon(&self, now_ns: i64) -> bool {
@@ -71,7 +77,7 @@ impl DriftController {
     /// Forget hysteresis (new track, seek by host, resume after interruption).
     pub fn reset(&mut self) {
         self.last_correction_ns = None;
-        self.nudging = false;
+        self.nudging = 0;
     }
 }
 
@@ -136,6 +142,23 @@ mod tests {
         assert_eq!(d.decide(10_100, 10_000, 0), Correction::Seek(10_100));
         assert_eq!(d.decide(10_100, 10_000, S), Correction::None);
         assert_eq!(d.decide(10_100, 10_000, 3 * S), Correction::Seek(10_100));
+    }
+
+    #[test]
+    fn seek_cancels_nudge_so_no_stale_reset() {
+        let mut d = DriftController::new();
+        assert_eq!(d.decide(10_100, 10_000, 0), Correction::Rate(1.02));
+        assert_eq!(d.decide(20_000, 10_000, 1), Correction::Seek(20_000));
+        // Seek implies rate 1.0: back in the deadband nothing else is due.
+        assert_eq!(d.decide(20_010, 20_000, S), Correction::None);
+    }
+
+    #[test]
+    fn nudge_flips_when_error_changes_sign() {
+        let mut d = DriftController::new();
+        assert_eq!(d.decide(10_100, 10_000, 0), Correction::Rate(1.02));
+        assert_eq!(d.decide(10_000, 10_100, 1), Correction::Rate(0.98));
+        assert_eq!(d.decide(10_000, 10_100, 2), Correction::None);
     }
 
     #[test]

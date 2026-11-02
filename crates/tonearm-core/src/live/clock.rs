@@ -16,12 +16,13 @@ pub struct Sample {
 }
 
 impl Sample {
+    /// Saturating: peer-supplied stamps must not overflow.
     pub fn rtt(&self) -> i64 {
-        (self.t3 - self.t0) - (self.t2 - self.t1)
+        self.t3.saturating_sub(self.t0).saturating_sub(self.t2.saturating_sub(self.t1))
     }
     /// host - local.
     pub fn offset(&self) -> i64 {
-        i64::midpoint(self.t1 - self.t0, self.t2 - self.t3)
+        i64::midpoint(self.t1.saturating_sub(self.t0), self.t2.saturating_sub(self.t3))
     }
 }
 
@@ -37,6 +38,7 @@ const EMA_ALPHA: f64 = 0.3;
 pub struct ClockSync {
     samples: Vec<Sample>,
     smoothed: Option<f64>,
+    /// Samples since the last reset (start, jump or [`Self::reset`]).
     total: usize,
 }
 
@@ -48,7 +50,7 @@ impl ClockSync {
     /// Adds a sample. Returns `false` for an impossible one (negative RTT),
     /// which is dropped.
     pub fn add(&mut self, s: Sample) -> bool {
-        if s.rtt() < 0 || s.t3 < s.t0 {
+        if s.rtt() < 0 || s.t3 < s.t0 || s.t2 < s.t1 {
             return false;
         }
         // A sample's offset error is at most rtt/2 (any delay asymmetry). One
@@ -59,6 +61,7 @@ impl ClockSync {
         {
             self.samples.clear();
             self.smoothed = None;
+            self.total = 0;
         }
         self.samples.retain(|o| s.t3 - o.t3 <= WINDOW_NS);
         self.samples.push(s);
@@ -86,7 +89,7 @@ impl ClockSync {
     }
 
     pub fn to_host(&self, local: i64) -> Option<i64> {
-        self.offset().map(|o| local + o)
+        self.offset().and_then(|o| local.checked_add(o))
     }
 
     /// Forget everything (after a reconnect or network change).
@@ -169,7 +172,21 @@ mod tests {
         assert_eq!(c.offset(), Some(0));
         // Host clock steps by 1 s (e.g. host app restarted its base).
         c.add(ping(600_000_000, 1_000_000_000, 2_000_000, 2_000_000, 0));
+        // One post-jump sample is not enough to trust again.
+        assert_eq!(c.offset(), None);
+        for i in 0..3 {
+            c.add(ping(700_000_000 + i * 100_000_000, 1_000_000_000, 2_000_000, 2_000_000, 0));
+        }
         assert_eq!(c.offset(), Some(1_000_000_000));
+    }
+
+    #[test]
+    fn hostile_stamps_do_not_overflow() {
+        let mut c = ClockSync::new();
+        for i in 0..4 {
+            c.add(Sample { t0: i, t1: i64::MAX, t2: i64::MAX, t3: i + 1 });
+        }
+        assert_eq!(c.to_host(i64::MAX / 2 + 10), None);
     }
 
     #[test]

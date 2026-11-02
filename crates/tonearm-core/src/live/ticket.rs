@@ -42,8 +42,9 @@ impl Ticket {
     /// Accepts the URL or the bare ticket (pasted text, QR content).
     pub fn parse(s: &str) -> Result<Self, TicketError> {
         let s = s.trim();
-        let body = if let Some(b) = s.strip_prefix(SCHEME_PREFIX) {
-            b
+        let n = SCHEME_PREFIX.len();
+        let body = if s.len() >= n && s.is_char_boundary(n) && s[..n].eq_ignore_ascii_case(SCHEME_PREFIX) {
+            &s[n..]
         } else if s.contains("://") {
             return Err(TicketError::NotInvitation);
         } else {
@@ -71,6 +72,12 @@ mod tests {
 
     fn t() -> Ticket {
         Ticket { v: 1, addr: "endpoint-xyz".into(), secret: "s3cr3t".into(), name: Some("Nico".into()) }
+    }
+
+    #[test]
+    fn scheme_is_case_insensitive() {
+        let u = t().to_url().replacen("sdat://join/", "SDAT://Join/", 1);
+        assert_eq!(Ticket::parse(&u), Ok(t()));
     }
 
     #[test]
